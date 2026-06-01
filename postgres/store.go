@@ -298,6 +298,12 @@ func (s *Store) GetRecord(ctx context.Context, tenantID, memoryID string) (corem
 	return record, nil
 }
 
+// GetRecordIncludingHidden returns the record even when Deleted or Disabled.
+// Unlike GetRecord it applies no visibility filter; ErrNotFound means absent.
+func (s *Store) GetRecordIncludingHidden(ctx context.Context, tenantID, memoryID string) (corememory.MemoryRecord, error) {
+	return s.loadRecordForUpdate(ctx, s.pool, tenantID, memoryID)
+}
+
 func (s *Store) lookupIdempotentWrite(ctx context.Context, q queryRower, in corememory.WriteRecordInput) (*corememory.WriteRecordResult, error) {
 	var requestHash string
 	var snapshotRaw []byte
