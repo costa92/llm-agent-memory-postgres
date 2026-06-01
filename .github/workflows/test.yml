@@ -13,32 +13,21 @@ concurrency:
 env:
   GOWORK: off  # INFRA-02: CI never picks up a workspace file silently
 
-# Workspace-only module: go.mod carries a local `replace` onto the (unpublished)
-# contract repo. CI mirrors that replace target by checking it out next to this
-# repo so `../llm-agent-memory-contract` resolves.
 jobs:
   go:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Checkout llm-agent-memory-postgres
-        uses: actions/checkout@v4
-        with:
-          path: llm-agent-memory-postgres
-      - name: Checkout llm-agent-memory-contract
-        uses: actions/checkout@v4
-        with:
-          repository: costa92/llm-agent-memory-contract
-          ref: main
-          path: llm-agent-memory-contract
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: llm-agent-memory-postgres/go.mod
+          go-version-file: go.mod
           cache: true
       - name: go mod tidy (drift check)
-        working-directory: llm-agent-memory-postgres
         run: |
           go mod tidy
+          # Use `git status --porcelain` (handles a missing go.sum cleanly)
+          # instead of `git diff --exit-code` (fatals on absent paths).
           drift=$(git status --porcelain go.mod go.sum 2>/dev/null)
           if [ -n "$drift" ]; then
             echo "go mod tidy changed files — commit tidy changes first"
@@ -47,11 +36,8 @@ jobs:
             exit 1
           fi
       - name: go vet
-        working-directory: llm-agent-memory-postgres
         run: go vet ./...
       - name: go build
-        working-directory: llm-agent-memory-postgres
         run: go build ./...
       - name: go test
-        working-directory: llm-agent-memory-postgres
         run: go test ./...
