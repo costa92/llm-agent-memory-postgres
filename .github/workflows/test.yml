@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOWORK: off  # INFRA-02: CI never picks up a workspace file silently
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go mod tidy (drift check)
+        run: |
+          go mod tidy
+          # Use `git status --porcelain` (handles a missing go.sum cleanly)
+          # instead of `git diff --exit-code` (fatals on absent paths).
+          drift=$(git status --porcelain go.mod go.sum 2>/dev/null)
+          if [ -n "$drift" ]; then
+            echo "go mod tidy changed files — commit tidy changes first"
+            echo "$drift"
+            git --no-pager diff -- go.mod go.sum || true
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test ./...

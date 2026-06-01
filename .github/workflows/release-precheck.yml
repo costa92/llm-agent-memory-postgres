@@ -1,0 +1,36 @@
+# .github/workflows/release-precheck.yml
+# INFRA-04: rejects `replace` directives on tagged-release branches.
+# Lifted from PITFALLS.md Pitfall 12 §"How to avoid". Identical across all 4 repos.
+name: release-precheck
+
+on:
+  push:
+    branches:
+      - 'release/**'
+  pull_request:
+    branches:
+      - 'release/**'
+
+jobs:
+  no-replace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Reject `replace` directives in go.mod
+        run: |
+          replace_count=$(go mod edit -json | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          replaces = data.get("Replace") or []
+          print(len(replaces))
+          ')
+          if [ "$replace_count" -ne 0 ]; then
+            echo "::error::go.mod contains $replace_count replace directive(s) — these MUST be removed before tagging."
+            echo "Detail:"
+            go mod edit -json | python3 -m json.tool | grep -A 100 '"Replace"' || true
+            exit 1
+          fi
+          echo "OK: go.mod has zero replace directives."

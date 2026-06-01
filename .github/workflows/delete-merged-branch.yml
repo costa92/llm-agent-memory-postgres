@@ -1,0 +1,82 @@
+name: delete-merged-branch
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: delete-merged-branch-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  delete-merged-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete merged head branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const mergeSha = context.sha;
+            const defaultBranch = context.payload.repository.default_branch;
+            const pushedRef = context.ref.replace("refs/heads/", "");
+
+            if (pushedRef !== defaultBranch) {
+              core.info(`Skip push to non-default branch ${pushedRef}`);
+              return;
+            }
+
+            const { data: pulls } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: mergeSha,
+            });
+
+            if (!pulls.length) {
+              core.info(`No PR associated with commit ${mergeSha}`);
+              return;
+            }
+
+            const pr = pulls.find((item) => item.merged_at) ?? pulls[0];
+            const sameRepo = pr.head.repo && pr.head.repo.full_name === context.payload.repository.full_name;
+
+            if (!sameRepo) {
+              core.info(`Skip deleting fork branch ${pr.head.label}`);
+              return;
+            }
+
+            if (pr.head.ref === defaultBranch) {
+              core.info(`Skip deleting default branch ${pr.head.ref}`);
+              return;
+            }
+
+            const ref = `heads/${pr.head.ref}`;
+
+            try {
+              await github.rest.git.getRef({
+                owner,
+                repo,
+                ref,
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                core.info(`Branch ${pr.head.ref} already deleted`);
+                return;
+              }
+              throw error;
+            }
+
+            await github.rest.git.deleteRef({
+              owner,
+              repo,
+              ref,
+            });
+
+            core.info(`Deleted merged branch ${pr.head.ref} for PR #${pr.number}`);

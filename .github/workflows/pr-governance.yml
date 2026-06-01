@@ -1,0 +1,164 @@
+name: pr-governance
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted, dismissed, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pr-governance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    if: github.event_name != 'pull_request_target' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate governance policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          author=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author --jq '.author.login')
+          head_sha=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+
+          if [ "${{ github.event.pull_request.draft }}" = "true" ]; then
+            echo "Draft PR: governance check is informational until the PR is marked ready."
+            exit 0
+          fi
+
+          if [ "$author" = "costa92" ]; then
+            echo "Owner-authored PR: governance check passes without extra review."
+            exit 0
+          fi
+
+          gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" \
+            -f 'reviewers[]=costa92' || true
+
+          review_json=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews")
+          latest_state=$(printf '%s' "$review_json" | python3 -c '
+          import json, sys
+          reviews = [r for r in json.load(sys.stdin) if r.get("user", {}).get("login") == "costa92" and r.get("state") != "COMMENTED"]
+          print(reviews[-1]["state"] if reviews else "")
+          ')
+          latest_commit=$(printf '%s' "$review_json" | python3 -c '
+          import json, sys
+          reviews = [r for r in json.load(sys.stdin) if r.get("user", {}).get("login") == "costa92" and r.get("state") != "COMMENTED"]
+          print(reviews[-1].get("commit_id", "") if reviews else "")
+          ')
+
+          if [ "$latest_state" = "APPROVED" ] && [ "$latest_commit" = "$head_sha" ]; then
+            echo "Approved by costa92 on current head: $head_sha"
+            exit 0
+          fi
+
+          echo "::error::PR requires a current-head approval from costa92 before merge."
+          echo "Latest costa92 review state: ${latest_state:-none}"
+          echo "Latest costa92 review commit: ${latest_commit:-none}"
+          echo "Current head: $head_sha"
+          exit 1
+
+  auto-merge-owner:
+    if: github.event_name != 'pull_request_target' || github.event.action != 'closed'
+    needs: governance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge for owner PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          author=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json author --jq '.author.login')
+          head_ref=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName --jq '.headRefName')
+          default_branch=$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')
+          head_repo=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRepositoryOwner --jq '.headRepositoryOwner.login')
+          repo_owner=${REPO%%/*}
+          if [ "${{ github.event.pull_request.draft }}" = "true" ]; then
+            echo "Draft PR: skip auto-merge."
+            exit 0
+          fi
+          if [ "$author" != "costa92" ]; then
+            echo "Non-owner PR: governance may pass after review, but merge remains manual."
+            exit 0
+          fi
+          auto_merge_enabled=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null')
+          if [ "$auto_merge_enabled" = "true" ]; then
+            echo "Auto-merge already enabled for owner PR."
+            exit 0
+          fi
+          gh pr merge "$PR_NUMBER" \
+            --repo "$REPO" \
+            --auto \
+            --merge
+
+          # Poll the PR because GitHub may report auto-merge enabled a little
+          # earlier than the merged state becomes visible via the PR API.
+          for _ in $(seq 1 90); do
+            state=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')
+            merged_at=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergedAt --jq '.mergedAt // ""')
+            if [ "$state" = "MERGED" ] && [ -n "$merged_at" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          state=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')
+          merged_at=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergedAt --jq '.mergedAt // ""')
+          if [ "$state" != "MERGED" ] || [ -z "$merged_at" ]; then
+            echo "PR not merged yet; leave branch cleanup to later automation."
+            exit 0
+          fi
+
+          if [ "$head_repo" != "$repo_owner" ]; then
+            echo "Skip deleting fork branch $head_repo:$head_ref"
+            exit 0
+          fi
+
+          if [ "$head_ref" = "$default_branch" ]; then
+            echo "Skip deleting default branch $head_ref"
+            exit 0
+          fi
+
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$head_ref" || true
+
+  cleanup-merged-branch:
+    if: github.event_name == 'pull_request_target' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Delete merged owner branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.owner.login }}
+        run: |
+          default_branch=$(gh repo view "$REPO" --json defaultBranchRef --jq '.defaultBranchRef.name')
+          repo_owner=${REPO%%/*}
+
+          if [ "$HEAD_REPO" != "$repo_owner" ]; then
+            echo "Skip deleting fork branch $HEAD_REPO:$HEAD_REF"
+            exit 0
+          fi
+
+          if [ "$HEAD_REF" = "$default_branch" ]; then
+            echo "Skip deleting default branch $HEAD_REF"
+            exit 0
+          fi
+
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$HEAD_REF" || true
