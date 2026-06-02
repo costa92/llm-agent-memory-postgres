@@ -65,6 +65,22 @@ documented in this file.
 - Postgres 11+ is now the minimum supported version (M8a-prep relies on
   nullable `ADD COLUMN` being metadata-only).
 
+## [0.1.1] - 2026-06-02
+
+### Fixed
+
+- **`ResolveDedupe` first-writer race (M8 C1).** The first-writer branch did
+  `SELECT ... FOR UPDATE` then a bare `INSERT`, but `FOR UPDATE` locks nothing
+  when the dedupe row does not yet exist. Two concurrent dedupers with the same
+  `dedupe_key` (e.g. the consolidation worker and the session-close reaper)
+  both saw an empty index and both inserted; one hit the
+  `(tenant_id, dedupe_key)` unique constraint, surfacing a raw `23505` error
+  that neither caller treated as stale (failing the operation). Replaced with
+  an atomic `INSERT ... ON CONFLICT DO NOTHING RETURNING`: a returned row means
+  this candidate won; a suppressed insert means a prior/concurrent winner
+  exists, so the loser path runs as before. Realises the loser-resolution the
+  M8 umbrella §4.3 already specified. No schema or API change.
+
 ## [0.1.0] - 2026-05-26
 
 ### Added
