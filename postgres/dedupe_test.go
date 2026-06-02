@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,6 +151,106 @@ func TestResolveDedupe_SecondWriterDeletesLoserAndEmitsCollapse(t *testing.T) {
 	}
 	if outbox.Metadata[corememory.DedupeCollapsedLoserIDMetadataKey] != loser.MemoryID {
 		t.Fatalf("collapse outbox loser metadata = %v, want %q", outbox.Metadata[corememory.DedupeCollapsedLoserIDMetadataKey], loser.MemoryID)
+	}
+}
+
+// TestResolveDedupe_ConcurrentFirstWritersOneWinsNoError is the C1 regression:
+// two callers race ResolveDedupe with the SAME dedupe_key against an empty
+// index. The old "SELECT ... FOR UPDATE then bare INSERT" head does not
+// serialise this — FOR UPDATE locks nothing when the row is absent, so both
+// callers INSERT and one hits the unique constraint, surfacing a raw error and
+// (in production) failing the session close. The fix must let exactly one
+// become the winner (DedupeNoCollision) and the other resolve as a loser
+// (DedupeMergedExisting), with NO error from either.
+func TestResolveDedupe_ConcurrentFirstWritersOneWinsNoError(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t, ctx)
+
+	prefix := fmt.Sprintf("m8a_%d_dedupe_race", time.Now().UnixNano())
+	s, err := New(pool, Config{TablePrefix: prefix})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	const dedupeKey = "tenant:user:project:race-content"
+	mkCandidate := func(idemSuffix, hash string) corememory.MemoryRecord {
+		res, err := s.WriteRecord(ctx, corememory.WriteRecordInput{
+			TenantID:       "tenant_a",
+			IdempotencyKey: "idem_dedupe_race_" + idemSuffix,
+			RequestHash:    "hash_dedupe_race_" + idemSuffix,
+			Record: corememory.MemoryRecord{
+				UserID:                "user_a",
+				Kind:                  corememory.RecordKindEpisodic,
+				Source:                "user_saved",
+				Category:              "project",
+				Content:               "race content",
+				NormalizedContentHash: hash,
+				Importance:            0.8,
+			},
+		})
+		if err != nil {
+			t.Fatalf("WriteRecord %s: %v", idemSuffix, err)
+		}
+		return res.Record
+	}
+
+	candA := mkCandidate("a", "race-hash-a")
+	candB := mkCandidate("b", "race-hash-b")
+
+	type outcome struct {
+		res corememory.ResolveDedupeResult
+		err error
+	}
+	results := make([]outcome, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, cand := range []corememory.MemoryRecord{candA, candB} {
+		wg.Add(1)
+		go func(idx int, candidate corememory.MemoryRecord) {
+			defer wg.Done()
+			<-start // fire both as simultaneously as possible
+			res, err := s.ResolveDedupe(ctx, corememory.ResolveDedupeInput{
+				TenantID:  candidate.TenantID,
+				DedupeKey: dedupeKey,
+				Candidate: candidate,
+			})
+			results[idx] = outcome{res: res, err: err}
+		}(i, cand)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, o := range results {
+		if o.err != nil {
+			t.Fatalf("ResolveDedupe[%d] returned error (C1 race not handled): %v", i, o.err)
+		}
+	}
+
+	winners := 0
+	losers := 0
+	var winnerID string
+	for _, o := range results {
+		switch o.res.Action {
+		case corememory.DedupeNoCollision:
+			winners++
+			winnerID = o.res.WinnerID
+		case corememory.DedupeMergedExisting, corememory.DedupeCollapsedByPin:
+			losers++
+		default:
+			t.Fatalf("unexpected action %v", o.res.Action)
+		}
+	}
+	if winners != 1 || losers != 1 {
+		t.Fatalf("want exactly one winner and one loser, got winners=%d losers=%d", winners, losers)
+	}
+	// Both callers must agree on the winner id.
+	for _, o := range results {
+		if o.res.WinnerID != winnerID {
+			t.Fatalf("callers disagree on winner: %q vs %q", o.res.WinnerID, winnerID)
+		}
 	}
 }
 

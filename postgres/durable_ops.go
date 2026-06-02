@@ -232,23 +232,25 @@ func (s *Store) ResolveDedupe(ctx context.Context, in corememory.ResolveDedupeIn
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// Check for an existing winner (FOR UPDATE to serialise concurrent dedupers).
+	// Atomically claim the winner slot. RETURNING yields a row only if WE
+	// performed the insert (i.e. this candidate is the winner). A bare
+	// "SELECT ... FOR UPDATE then INSERT" does NOT serialise concurrent
+	// first-writers: FOR UPDATE locks nothing when the row is absent, so two
+	// callers both see an empty index and both INSERT, and one hits the unique
+	// constraint (the C1 race). INSERT ... ON CONFLICT DO NOTHING makes the
+	// claim atomic; if the conflicting row belongs to an uncommitted peer, the
+	// INSERT blocks until that peer resolves, then reports the conflict here.
 	var winnerID string
-	selectErr := tx.QueryRow(ctx,
-		fmt.Sprintf(`SELECT winner_memory_id FROM %s WHERE tenant_id = $1 AND dedupe_key = $2 FOR UPDATE`,
-			s.dedupeIndexTable()),
-		in.TenantID, in.DedupeKey,
+	claimErr := tx.QueryRow(ctx,
+		fmt.Sprintf(`INSERT INTO %s (tenant_id, dedupe_key, winner_memory_id)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
+			RETURNING winner_memory_id`, s.dedupeIndexTable()),
+		in.TenantID, in.DedupeKey, in.Candidate.MemoryID,
 	).Scan(&winnerID)
 
-	if isNoRows(selectErr) {
-		// First writer — register the candidate as winner.
-		if _, err := tx.Exec(ctx,
-			fmt.Sprintf(`INSERT INTO %s (tenant_id, dedupe_key, winner_memory_id) VALUES ($1, $2, $3)`,
-				s.dedupeIndexTable()),
-			in.TenantID, in.DedupeKey, in.Candidate.MemoryID,
-		); err != nil {
-			return corememory.ResolveDedupeResult{}, fmt.Errorf("memory/postgres: insert dedupe index: %w", err)
-		}
+	if claimErr == nil {
+		// We registered the candidate as winner — first writer.
 		if err := tx.Commit(ctx); err != nil {
 			return corememory.ResolveDedupeResult{}, fmt.Errorf("memory/postgres: commit dedupe first-writer tx: %w", err)
 		}
@@ -257,8 +259,18 @@ func (s *Store) ResolveDedupe(ctx context.Context, in corememory.ResolveDedupeIn
 			Action:   corememory.DedupeNoCollision,
 		}, nil
 	}
-	if selectErr != nil {
-		return corememory.ResolveDedupeResult{}, fmt.Errorf("memory/postgres: query dedupe index: %w", selectErr)
+	if !isNoRows(claimErr) {
+		return corememory.ResolveDedupeResult{}, fmt.Errorf("memory/postgres: claim dedupe index: %w", claimErr)
+	}
+
+	// ON CONFLICT fired (no row returned): a prior/concurrent winner exists.
+	// Lock that row and resolve this candidate as the loser within this tx.
+	if err := tx.QueryRow(ctx,
+		fmt.Sprintf(`SELECT winner_memory_id FROM %s WHERE tenant_id = $1 AND dedupe_key = $2 FOR UPDATE`,
+			s.dedupeIndexTable()),
+		in.TenantID, in.DedupeKey,
+	).Scan(&winnerID); err != nil {
+		return corememory.ResolveDedupeResult{}, fmt.Errorf("memory/postgres: query dedupe index: %w", err)
 	}
 
 	// Collision: everything below runs in the same tx for atomicity.
