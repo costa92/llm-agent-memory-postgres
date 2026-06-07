@@ -41,3 +41,20 @@ func TestNewRandomWorkerID_HostnameFailureFallback(t *testing.T) {
 		t.Fatalf("worker id %q missing 'unknown-' prefix", id)
 	}
 }
+
+func TestNewRandomWorkerID_HostnameSanitized(t *testing.T) {
+	prev := hostnameFn
+	t.Cleanup(func() { hostnameFn = prev })
+	// macOS-style hostname mixing hyphens and dots — both must be sanitized
+	// so the suffix-delimiter '-' remains the only one in the worker ID.
+	hostnameFn = func() (string, error) { return "MacBook-Pro.local", nil }
+
+	id := NewRandomWorkerID()
+	if !workerIDFormat.MatchString(id) {
+		t.Fatalf("worker id %q does not match %s", id, workerIDFormat)
+	}
+	const wantPrefix = "MacBook_Pro_local-"
+	if len(id) < len(wantPrefix) || id[:len(wantPrefix)] != wantPrefix {
+		t.Fatalf("worker id %q missing sanitized prefix %q", id, wantPrefix)
+	}
+}
